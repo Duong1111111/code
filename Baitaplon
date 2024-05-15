@@ -248,3 +248,4 @@ for (test, sample_submission) in iter_test:
         sample_submission.loc[mask,'correct'] = n_predictions.flatten()
     
     env.predict(sample_submission)
+! head submission.csv
