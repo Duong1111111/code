@@ -1,0 +1,250 @@
+import tensorflow as tf
+import tensorflow_addons as tfa
+import tensorflow_decision_forests as tfdf
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+dtypes={
+    'elapsed_time':np.int32,
+    'event_name':'category',
+    'name':'category',
+    'level':np.uint8,
+    'room_coor_x':np.float32,
+    'room_coor_y':np.float32,
+    'screen_coor_x':np.float32,
+    'screen_coor_y':np.float32,
+    'hover_duration':np.float32,
+    'text':'category',
+    'fqid':'category',
+    'room_fqid':'category',
+    'text_fqid':'category',
+    'fullscreen':'category',
+    'hq':'category',
+    'music':'category',
+    'level_group':'category'}
+
+dataset_df = pd.read_csv('test.csv', dtype=dtypes)
+print("Full train dataset shape is {}".format(dataset_df.shape))
+print (dataset_df.head(5))
+labels = pd.read_csv('train_labels.csv')
+labels['session'] = labels.session_id.apply(lambda x: int(x.split('_')[0]) )
+labels['q'] = labels.session_id.apply(lambda x: int(x.split('_')[-1][1:]) )
+print(labels.head(5))
+
+
+plt.figure(figsize=(10, 20))
+plt.subplots_adjust(hspace=0.5, wspace=0.5)
+plt.suptitle("\"Correct\" column values for each question", fontsize=14, y=0.94)
+for n in range(1,19):
+    #print(n, str(n))
+    ax = plt.subplot(6, 3, n)
+
+    # filter df and plot ticker on the new subplot axis
+    plot_df = labels.loc[labels.q == n]
+    plot_df = plot_df.correct.value_counts()
+    plot_df.plot(ax=ax, kind="bar", color=['b', 'c'])
+    
+    # chart formatting
+    ax.set_title("Question " + str(n))
+    ax.set_xlabel("")
+
+CATEGORICAL = ['event_name', 'name','fqid', 'room_fqid', 'text_fqid']
+NUMERICAL = ['elapsed_time','level','page','room_coor_x', 'room_coor_y', 
+        'screen_coor_x', 'screen_coor_y', 'hover_duration']
+def feature_engineer(dataset_df):
+    dfs = []
+    for c in CATEGORICAL:
+        tmp = dataset_df.groupby(['session_id','level_group'])[c].agg('nunique')
+        tmp.name = tmp.name + '_nunique'
+        dfs.append(tmp)
+    for c in NUMERICAL:
+        tmp = dataset_df.groupby(['session_id','level_group'])[c].agg('mean')
+        dfs.append(tmp)
+    for c in NUMERICAL:
+        tmp = dataset_df.groupby(['session_id','level_group'])[c].agg('std')
+        tmp.name = tmp.name + '_std'
+        dfs.append(tmp)
+    dataset_df = pd.concat(dfs,axis=1)
+    dataset_df = dataset_df.fillna(-1)
+    dataset_df = dataset_df.reset_index()
+    dataset_df = dataset_df.set_index('session_id')
+    return dataset_df
+
+dataset_df = feature_engineer(dataset_df)
+print("Full prepared dataset shape is {}".format(dataset_df.shape))
+print(dataset_df.head(5))
+print(dataset_df.describe())
+figure, axis = plt.subplots(3, 2, figsize=(10, 10))
+
+for name, data in dataset_df.groupby('level_group'):
+    axis[0, 0].plot(range(1, len(data['room_coor_x_std'])+1), data['room_coor_x_std'], label=name)
+    axis[0, 1].plot(range(1, len(data['room_coor_y_std'])+1), data['room_coor_y_std'], label=name)
+    axis[1, 0].plot(range(1, len(data['screen_coor_x_std'])+1), data['screen_coor_x_std'], label=name)
+    axis[1, 1].plot(range(1, len(data['screen_coor_y_std'])+1), data['screen_coor_y_std'], label=name)
+    axis[2, 0].plot(range(1, len(data['hover_duration'])+1), data['hover_duration_std'], label=name)
+    axis[2, 1].plot(range(1, len(data['elapsed_time_std'])+1), data['elapsed_time_std'], label=name)
+    
+
+axis[0, 0].set_title('room_coor_x')
+axis[0, 1].set_title('room_coor_y')
+axis[1, 0].set_title('screen_coor_x')
+axis[1, 1].set_title('screen_coor_y')
+axis[2, 0].set_title('hover_duration')
+axis[2, 1].set_title('elapsed_time_std')
+
+for i in range(3):
+    axis[i, 0].legend()
+    axis[i, 1].legend()
+
+plt.show()
+
+
+def split_dataset(dataset, test_ratio=0.20):
+    USER_LIST = dataset.index.unique()
+    split = int(len(USER_LIST) * (1 - 0.20))
+    return dataset.loc[USER_LIST[:split]], dataset.loc[USER_LIST[split:]]
+
+train_x, valid_x = split_dataset(dataset_df)
+print("{} examples in training, {} examples in testing.".format(
+    len(train_x), len(valid_x)))
+
+model = tfdf.keras.RandomForestModel()
+rf = tfdf.keras.GradientBoostedTreesModel(hyperparameter_template="benchmark_rank1")
+# Fetch the unique list of user sessions in the validation dataset. We assigned 
+# `session_id` as the index of our feature engineered dataset. Hence fetching 
+# the unique values in the index column will give us a list of users in the 
+# validation set.
+VALID_USER_LIST = valid_x.index.unique()
+
+# Create a dataframe for storing the predictions of each question for all users
+# in the validation set.
+# For this, the required size of the data frame is: 
+# (no: of users in validation set  x no of questions).
+# We will initialize all the predicted values in the data frame to zero.
+# The dataframe's index column is the user `session_id`s. 
+prediction_df = pd.DataFrame(data=np.zeros((len(VALID_USER_LIST),18)), index=VALID_USER_LIST)
+
+# Create an empty dictionary to store the models created for each question.
+models = {}
+
+# Create an empty dictionary to store the evaluation score for each question.
+evaluation_dict ={}
+# Iterate through questions 1 to 18 to train models for each question, evaluate
+# the trained model and store the predicted values.
+for q_no in range(1,19):
+
+    # Select level group for the question based on the q_no.
+    if q_no<=3: grp = '0-4'
+    elif q_no<=13: grp = '5-12'
+    elif q_no<=22: grp = '13-22'
+    print("### q_no", q_no, "grp", grp)
+    
+        
+    # Filter the rows in the datasets based on the selected level group. 
+    train_df = train_x.loc[train_x.level_group == grp]
+    train_users = train_df.index.values
+    valid_df = valid_x.loc[valid_x.level_group == grp]
+    valid_users = valid_df.index.values
+
+    # Select the labels for the related q_no.
+    train_labels = labels.loc[labels.q==q_no].set_index('session').loc[train_users]
+    valid_labels = labels.loc[labels.q==q_no].set_index('session').loc[valid_users]
+
+    # Add the label to the filtered datasets.
+    train_df["correct"] = train_labels["correct"]
+    valid_df["correct"] = valid_labels["correct"]
+
+    # There's one more step required before we can train the model. 
+    # We need to convert the datatset from Pandas format (pd.DataFrame)
+    # into TensorFlow Datasets format (tf.data.Dataset).
+    # TensorFlow Datasets is a high performance data loading library 
+    # which is helpful when training neural networks with accelerators like GPUs and TPUs.
+    # We are omitting `level_group`, since it is not needed for training anymore.
+    train_ds = tfdf.keras.pd_dataframe_to_tf_dataset(train_df.loc[:, train_df.columns != 'level_group'], label="correct")
+    valid_ds = tfdf.keras.pd_dataframe_to_tf_dataset(valid_df.loc[:, valid_df.columns != 'level_group'], label="correct")
+
+    # We will now create the Gradient Boosted Trees Model with default settings. 
+    # By default the model is set to train for a classification task.
+    gbtm = tfdf.keras.GradientBoostedTreesModel(verbose=0)
+    gbtm.compile(metrics=["accuracy"])
+
+    # Train the model.
+    gbtm.fit(x=train_ds)
+
+    # Store the model
+    models[f'{grp}_{q_no}'] = gbtm
+
+    # Evaluate the trained model on the validation dataset and store the 
+    # evaluation accuracy in the `evaluation_dict`.
+    inspector = gbtm.make_inspector()
+    inspector.evaluation()
+    evaluation = gbtm.evaluate(x=valid_ds,return_dict=True)
+    evaluation_dict[q_no] = evaluation["accuracy"]         
+
+    # Use the trained model to make predictions on the validation dataset and 
+    # store the predicted values in the `prediction_df` dataframe.
+    predict = gbtm.predict(x=valid_ds)
+    prediction_df.loc[valid_users, q_no-1] = predict.flatten() 
+       
+for name, value in evaluation_dict.items():
+    print(f"question {name}: accuracy {value:.4f}")
+
+print("\nAverage accuracy", sum(evaluation_dict.values())/18) 
+tfdf.model_plotter.plot_model_in_colab(models['0-4_1'], tree_idx=0, max_depth=3)
+inspector = models['0-4_1'].make_inspector()
+
+print(f"Available variable importances:")
+for importance in inspector.variable_importances().keys():
+  print("\t", importance)
+  # Each line is: (feature name, (index of the feature), importance score)
+inspector.variable_importances()["NUM_AS_ROOT"]
+# Create a dataframe of required size:
+# (no: of users in validation set x no: of questions) initialized to zero values
+# to store true values of the label `correct`. 
+true_df = pd.DataFrame(data=np.zeros((len(VALID_USER_LIST),18)), index=VALID_USER_LIST)
+for i in range(18):
+    # Get the true labels.
+    tmp = labels.loc[labels.q == i+1].set_index('session').loc[VALID_USER_LIST]
+    true_df[i] = tmp.correct.values
+
+max_score = 0; best_threshold = 0
+
+# Loop through threshold values from 0.4 to 0.8 and select the threshold with 
+# the highest `F1 score`.
+for threshold in np.arange(0.4,0.8,0.01):
+    metric = tfa.metrics.F1Score(num_classes=2,average="macro",threshold=threshold)
+    y_true = tf.one_hot(true_df.values.reshape((-1)), depth=2)
+    y_pred = tf.one_hot((prediction_df.values.reshape((-1))>threshold).astype('int'), depth=2)
+    metric.update_state(y_true, y_pred)
+    f1_score = metric.result().numpy()
+    if f1_score > max_score:
+        max_score = f1_score
+        best_threshold = threshold
+        
+print("Best threshold ", best_threshold, "\tF1 score ", max_score)
+# Reference
+# https://www.kaggle.com/code/philculliton/basic-submission-demo
+# https://www.kaggle.com/code/cdeotte/random-forest-baseline-0-664/notebook
+
+
+import jo_wilder
+env = jo_wilder.make_env()
+iter_test = env.iter_test()
+
+limits = {'0-4':(1,4), '5-12':(4,14), '13-22':(14,19)}
+
+for (test, sample_submission) in iter_test:
+    test_df = feature_engineer(test)
+    grp = test_df.level_group.values[0]
+    a,b = limits[grp]
+    for t in range(a,b):
+        gbtm = models[f'{grp}_{t}']
+        test_ds = tfdf.keras.pd_dataframe_to_tf_dataset(test_df.loc[:, test_df.columns != 'level_group'])
+        predictions = gbtm.predict(test_ds)
+        mask = sample_submission.session_id.str.contains(f'q{t}')
+        n_predictions = (predictions > best_threshold).astype(int)
+        sample_submission.loc[mask,'correct'] = n_predictions.flatten()
+    
+    env.predict(sample_submission)
